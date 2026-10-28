@@ -118,6 +118,36 @@ async function runHeavyStartup() {
   import("@/sse/services/backgroundTokenRefresh.js")
     .then(({ startBackgroundTokenRefresh }) => startBackgroundTokenRefresh())
     .catch((e) => console.log("[BackgroundTokenRefresh] scheduler start failed:", e.message));
+
+  // Auto Switch IP: the toggle is persisted but the engine is a separate
+  // process, so a server restart loses it. Respawn when the user left it on —
+  // otherwise the dashboard would show "enabled" for an engine that is not
+  // running, and egress would quietly stop rotating.
+  //
+  // Binaries are re-provisioned first: a container redeploy gets a fresh
+  // volume on some platforms, and spawning the daemon without sing-box would
+  // leave it retrying a missing file every 30 s with nothing in the log the
+  // user would think to connect to the redeploy.
+  if (settings?.autoSwitchIp?.enabled === true) {
+    import("@/lib/autoswitchip/engine")
+      .then(async ({ startEngine, checkPython, provisionBinaries }) => {
+        const python = await checkPython();
+        if (!python.ok) {
+          console.log("[AutoSwitchIp] resume skipped: Python + requests/PyYAML not found");
+          return;
+        }
+        const binaries = await provisionBinaries();
+        if (!binaries.ok) {
+          console.log("[AutoSwitchIp] resume skipped:", binaries.error);
+          return;
+        }
+        const result = startEngine();
+        if (!result.ok) {
+          console.log("[AutoSwitchIp] resume failed:", result.error);
+        }
+      })
+      .catch((e) => console.log("[AutoSwitchIp] engine import failed:", e.message));
+  }
 }
 
 // Cheap local check: keeps the scheduler module (and its provider graph) unloaded

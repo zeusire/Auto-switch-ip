@@ -71,6 +71,13 @@ COPY --from=builder /app/node_modules/node-machine-id ./node_modules/node-machin
 # The native binding is resolved by relative path from the package, so it ships too.
 COPY --from=builder /app/node_modules/wreq-js ./node_modules/wreq-js
 COPY --from=builder /app/node_modules/@wreq-js ./node_modules/@wreq-js
+# Auto Switch IP engine (Python). Tracing follows the spawn path poorly — it
+# copies .py files only when a route reads the directory at build time — so the
+# whole directory ships explicitly. Its binaries (sing-box/usque) are downloaded
+# into DATA_DIR on first enable, not baked here: 55 MB in a layer for a feature
+# that may never be switched on, and the release CDN is not always reachable
+# from a build sandbox.
+COPY --from=builder /app/autoswitchip ./autoswitchip
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \
@@ -78,7 +85,12 @@ RUN mkdir -p /app/data && chown -R node:node /app && \
 
 # Avoid a full distribution upgrade in the runtime image. It makes builds less
 # reproducible and is unrelated to installing the runtime entrypoint helper.
-RUN apk add --no-cache su-exec ffmpeg && \
+#
+# python3 + py3-requests + py3-yaml: the Auto Switch IP engine's interpreter and
+# its only non-stdlib imports. Installed from apk rather than pip — the runtime
+# image deliberately has no build toolchain, and these two packages are exactly
+# the versions Alpine tests together.
+RUN apk add --no-cache su-exec ffmpeg python3 py3-requests py3-yaml && \
   printf '#!/bin/sh\nchown -R node:node /app/data /app/data-home 2>/dev/null\nexec su-exec node "$@"\n' > /entrypoint.sh && \
   chmod +x /entrypoint.sh
 

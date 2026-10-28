@@ -1,0 +1,6 @@
+# 运行期依赖（系统 python3 即可，无需 venv）
+# 这个文件会被容器镜像和 dashboard 的启用流程读取，所以只列运行期需要的三项；
+# pytest 在 requirements-dev.txt 里，别让生产镜像为了测试装一整套工具链。
+requests>=2.31
+urllib3>=2.0
+PyYAML>=6.0

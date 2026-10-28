@@ -23,6 +23,9 @@ const DEFAULT_SETTINGS = {
     audioInput: { enabled: true, roundRobin: false, models: [] },
     videoInput: { enabled: false, roundRobin: false, models: [] },
   },
+  // Auto Switch IP — off by default; enabling spawns the Python engine that
+  // rotates the WARP egress used by the OpenCode free tier.
+  autoSwitchIp: { enabled: false },
   requireLogin: true,
   requireApiKey: true,
   tunnelDashboardAccess: true,

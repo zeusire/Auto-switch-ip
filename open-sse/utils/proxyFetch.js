@@ -253,9 +253,17 @@ async function getDispatcher(proxyUrl, insecure = false) {
 
 async function fetchWithTlsFallback(url, options, proxyUrl) {
   try {
-    // Protocol adapters may need Node's HTTP/1 transport on the direct path.
-    // Keep proxy/no-proxy resolution and strict-proxy enforcement here.
-    if (!proxyUrl && options.directFetch) return await options.directFetch(url, options);
+    // A protocol adapter that supplies `directFetch` needs its own transport
+    // *and* the resolved proxy. It used to be consulted only when no proxy was
+    // configured, which inverted the intent: the one adapter that must never
+    // fall back to Node's TLS stack (OpenCode's free-tier gate keys on the
+    // ClientHello) silently did exactly that as soon as an outbound proxy was
+    // set. Off-proxy an impersonated client is refused with 403 FreeTierError;
+    // proxied through undici it is refused the same way. The adapter owns the
+    // CONNECT itself (wreq-js speaks http(s) and SOCKS4/5), so hand it both.
+    if (options.directFetch) {
+      return await options.directFetch(url, options, proxyUrl || null);
+    }
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
     return await originalFetch(url, dispatcher ? { ...options, dispatcher } : options);
   } catch (err) {
