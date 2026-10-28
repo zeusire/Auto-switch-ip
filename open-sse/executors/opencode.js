@@ -189,6 +189,12 @@ export function stableSessionId(credentials) {
 const ROTATE_COOLDOWN_MS = 2 * 60 * 1000;
 const rotationState = new Map();
 
+// A retry-after longer than this is not a session limit: the free tier meters
+// per IP as well, and an exhausted IP answers every fresh session with the same
+// 429. Rotating then only spends a request to learn what the header already
+// said, so the limit is handed to the caller instead.
+const SESSION_ROTATE_MAX_RETRY_AFTER_MS = 5 * 60 * 1000;
+
 function isSessionQuotaError(status, message) {
   if (status !== 429) return false;
   // A 429 without a session-quota body is still a rate limit on this session —
@@ -200,6 +206,16 @@ function isSessionQuotaError(status, message) {
     || lower.includes("free usage limit")
     || lower.includes("rate limit")
     || lower.includes("too many requests");
+}
+
+/** Upstream's retry-after in ms, or null when absent/unparseable. */
+function parseRetryAfterMs(response) {
+  const raw = response?.headers?.get?.("retry-after");
+  if (!raw) return null;
+  const seconds = Number(String(raw).trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(raw);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }
 
 /**
@@ -241,7 +257,7 @@ export function resetOpencodeSessionRotation() {
   translatedOpencodeSessions.clear();
 }
 
-export const __test__ = { ROTATE_COOLDOWN_MS, isSessionQuotaError };
+export const __test__ = { ROTATE_COOLDOWN_MS, SESSION_ROTATE_MAX_RETRY_AFTER_MS, isSessionQuotaError, parseRetryAfterMs };
 
 function bodyHasSessionHints(body) {
   try {
@@ -508,6 +524,15 @@ export class OpenCodeExecutor extends BaseExecutor {
     // A session-scoped 429 is recoverable: re-mint and send once more. Without
     // this the exhausted session stayed pinned in RAM and every later request
     // failed until the process restarted.
+    //
+    // The IP-scoped limit is not recoverable this way. It arrives as the same
+    // FreeUsageLimitError, but carries a retry-after measured in hours and
+    // refuses every fresh session too, so rotating would only burn a request.
+    const retryAfterMs = parseRetryAfterMs(result.response);
+    if (retryAfterMs != null && retryAfterMs > SESSION_ROTATE_MAX_RETRY_AFTER_MS) {
+      args.log?.debug?.("RETRY", `opencode 429 — IP-scoped limit, reset in ${Math.round(retryAfterMs / 60000)}m; not rotating`);
+      return result;
+    }
     if (!isSessionQuotaError(result.response.status, await peekErrorText(result.response))) return result;
     if (!rotateConversationSession(args.credentials, args.providerSessionId, args.clientTool)) return result;
 

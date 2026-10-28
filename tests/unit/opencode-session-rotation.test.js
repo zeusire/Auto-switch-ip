@@ -23,9 +23,14 @@ function makeCredentials(overrides = {}) {
   return { connectionId: "conn_rotate", rawHeaders: {}, ...overrides };
 }
 
-function jsonResponse(status, body = "{}") {
-  return new Response(body, { status, headers: { "content-type": "application/json" } });
+function jsonResponse(status, body = "{}", headers = {}) {
+  return new Response(body, { status, headers: { "content-type": "application/json", ...headers } });
 }
+
+const IP_LIMIT_BODY = JSON.stringify({
+  type: "error",
+  error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
+});
 
 function execute(executor, overrides = {}) {
   return executor.execute({
@@ -130,5 +135,60 @@ describe("OpenCode session rotation on 429", () => {
     await execute(executor, { credentials });
 
     expect(sessionOfCall(0)).toBe(sessionOfCall(1));
+  });
+});
+
+// The free tier meters per IP as well as per session, and the IP limit answers
+// with the same FreeUsageLimitError. Measured on a Railway host 2026-10-28:
+// every fresh session still got 429 with `retry-after: 27265` (~7.5h). Rotating
+// there cannot help — only waiting does.
+describe("OpenCode IP-scoped 429 is not a session limit", () => {
+  it("does not rotate when retry-after is measured in hours", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(429, IP_LIMIT_BODY, { "retry-after": "27265" })
+    );
+
+    const executor = getExecutor("opencode");
+    const result = await execute(executor);
+
+    expect(result.response.status).toBe(429);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still rotates when retry-after is short enough to be a session window", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(429, IP_LIMIT_BODY, { "retry-after": "45" }))
+      .mockResolvedValueOnce(jsonResponse(200, "{}"));
+
+    const executor = getExecutor("opencode");
+    const result = await execute(executor);
+
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rotates when the 429 carries no retry-after at all", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(429, IP_LIMIT_BODY))
+      .mockResolvedValueOnce(jsonResponse(200, "{}"));
+
+    const executor = getExecutor("opencode");
+    const result = await execute(executor);
+
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("parses retry-after as seconds or as an HTTP date", async () => {
+    const { parseRetryAfterMs } = await import("../../open-sse/executors/opencode.js")
+      .then((m) => m.__test__);
+
+    expect(parseRetryAfterMs(new Response("", { headers: { "retry-after": "120" } }))).toBe(120000);
+    expect(parseRetryAfterMs(new Response("", {}))).toBeNull();
+
+    const inOneHour = new Date(Date.now() + 3600_000).toUTCString();
+    const fromDate = parseRetryAfterMs(new Response("", { headers: { "retry-after": inOneHour } }));
+    expect(fromDate).toBeGreaterThan(3590_000);
+    expect(fromDate).toBeLessThanOrEqual(3600_000);
   });
 });
