@@ -40,6 +40,7 @@ from typing import NamedTuple
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
+import config
 from config import CFG, DATA_DIR, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, TRANSPORT_LOOKBACK_SEC, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
 from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
@@ -6701,6 +6702,10 @@ def main():
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
+    # Before anything talks to the Clash API: a host with no install step
+    # (Railway, Windows) has no secret file, and sing-box would then refuse
+    # every authenticated call for the life of the container.
+    config.ensure_singbox_secret()
 
     # 没有 systemd 的主机（Railway 容器、Windows 桌面端）由 supervisor 持有
     # 隧道与 sing-box 子进程。它必须比第一次换线更早起来：request_restart 找不到
@@ -6922,9 +6927,14 @@ def main():
                     # 用户要求：切换后只要出现新的错误就立即再切，不受冷却限制。
                     # max_backoff_ts=上次成功切换时刻，天然排除切换前的旧错误。
                     # 换节点要预检（最慢 30s），丢后台。
-                    _, errors_after_switch, _, _, _ = get_9router_error_rate(
+                    # `ErrorWindow` is a NamedTuple that gained a trailing
+                    # `transport_errors` field; positional unpacking silently
+                    # breaks every time a field is appended (this call raised
+                    # ValueError every tick and killed the monitoring loop).
+                    # Read the field instead, so adding one more cannot do it again.
+                    errors_after_switch = get_9router_error_rate(
                         max_backoff_ts=_last_successful_switch_ts or None
-                    )
+                    ).errors
                     if errors_after_switch >= 3:
                         _submit_once("pool-rotate-on-error", _rotate_on_error_bg,
                                      errors, total, cached_all_nodes, now)

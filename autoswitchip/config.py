@@ -76,22 +76,75 @@ def get_lan_auth() -> tuple[str, str] | None:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取局域网认证失败: {e}", file=sys.stderr)
         return None
 
+def ensure_singbox_secret() -> str:
+    """Create the Clash API secret if the host has none yet.
+
+    `deploy/install.sh` does this on a systemd host, but Railway and the Windows
+    app have no install step — sing-box then starts with an empty secret and the
+    engine can never authenticate, while every status read spams the log. The
+    secret only guards a loopback Clash API, so generating it locally is safe
+    and matches what install.sh produces (32 random bytes, base64).
+    """
+    existing = get_singbox_secret()
+    if existing:
+        return existing
+    try:
+        import base64
+        import secrets as _secrets
+        os.makedirs(os.path.dirname(SECRET_FILE) or ".", exist_ok=True)
+        fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(base64.b64encode(_secrets.token_bytes(32)).decode())
+        try:
+            os.chmod(SECRET_FILE, 0o600)
+        except OSError:
+            pass
+        global _SINGBOX_SECRET, _SINGBOX_SECRET_MTIME, _SECRET_ERROR_LOGGED
+        _SINGBOX_SECRET = ""
+        _SINGBOX_SECRET_MTIME = 0
+        _SECRET_ERROR_LOGGED = False
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 已生成 sing-box secret: {SECRET_FILE}")
+        return get_singbox_secret()
+    except Exception as e:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 生成 sing-box secret 失败: {e}",
+              file=sys.stderr)
+        return ""
+
+
+_SECRET_ERROR_LOGGED = False
+
+
 def get_singbox_secret() -> str:
-    """Get sing-box secret with mtime-based auto-refresh."""
-    global _SINGBOX_SECRET, _SINGBOX_SECRET_MTIME
+    """Get sing-box secret with mtime-based auto-refresh.
+
+    Called on every Clash API request (several times a second while the engine
+    is healthy), so a missing or unreadable file must be reported once, not
+    once per call: on a host that never had a secret created, the previous
+    version wrote ~4 identical traceback lines per second into daemon.log and
+    buried every real message. The warning is re-armed as soon as the file
+    becomes readable again, so a *new* failure after a fix is still reported.
+    """
+    global _SINGBOX_SECRET, _SINGBOX_SECRET_MTIME, _SECRET_ERROR_LOGGED
     try:
         st = os.stat(SECRET_FILE)
         mtime = st.st_mtime
         if _SINGBOX_SECRET and mtime == _SINGBOX_SECRET_MTIME:
             return _SINGBOX_SECRET
-        if st.st_mode & 0o077:
+        # Windows synthesises mode bits (chmod only toggles the read-only flag),
+        # so every file there would read as 0o666 and warn forever.
+        import os as _os
+        if _os.name != "nt" and st.st_mode & 0o077:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ Secret file loose perms ({oct(st.st_mode & 0o777)})")
         with open(SECRET_FILE) as f:
             _SINGBOX_SECRET = f.read().strip()
         _SINGBOX_SECRET_MTIME = mtime
+        _SECRET_ERROR_LOGGED = False
         return _SINGBOX_SECRET
     except Exception as e:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取密钥文件失败: {e}")
+        if not _SECRET_ERROR_LOGGED:
+            _SECRET_ERROR_LOGGED = True
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取密钥文件失败: {e} "
+                  f"（只报这一次，恢复后自动重置）")
         return ""
 
 # 启动时校验密钥 (活值) — 不冻结常量, 避免 secret 轮换后失效
