@@ -88,11 +88,16 @@ const translatedSessionCleanup = setInterval(() => {
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
 if (translatedSessionCleanup.unref) translatedSessionCleanup.unref();
 
+/** Memo key for one conversation's translated session, shared with rotation. */
+function translationKey(sessionId, clientTool = "") {
+  return `${clientTool || "generic"}\0${sessionId || ""}`;
+}
+
 export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-  const key = `${clientTool || "generic"}\0${sessionId || ""}`;
+  const key = translationKey(sessionId, clientTool);
   const existing = translatedOpencodeSessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
@@ -170,6 +175,73 @@ export function stableSessionId(credentials) {
   stableOpencodeSessions.set(key, { sessionId, lastUsed: Date.now() });
   return sessionId;
 }
+
+// ─── 429 session rotation ────────────────────────────────────────────────────
+// The free tier meters quota per upstream session, so one long-lived session
+// eventually answers 429 FreeUsageLimitError on every request while the account
+// and IP are still healthy. Only a restart cleared it, because every session
+// store above lives in RAM. Re-mint the session instead: on a 429 that is
+// *about* the session, drop it and send once more under a fresh one.
+//
+// Guarded so a genuine account-wide limit cannot turn into a new-session-per-
+// request storm (the failure mode the stable store above exists to prevent):
+// rotate at most once per identity per ROTATE_COOLDOWN_MS.
+const ROTATE_COOLDOWN_MS = 2 * 60 * 1000;
+const rotationState = new Map();
+
+function isSessionQuotaError(status, message) {
+  if (status !== 429) return false;
+  // A 429 without a session-quota body is still a rate limit on this session —
+  // the free lane has no other meter. Text is checked only to keep a future
+  // account-wide 429 out of the rotation path once one appears.
+  const lower = String(message || "").toLowerCase();
+  if (!lower) return true;
+  return lower.includes("freeusagelimit")
+    || lower.includes("free usage limit")
+    || lower.includes("rate limit")
+    || lower.includes("too many requests");
+}
+
+/**
+ * True when this identity is allowed to rotate again — at most once per
+ * ROTATE_COOLDOWN_MS, so a genuine account-wide limit cannot mint a new session
+ * on every request. Records the attempt when it returns true.
+ */
+function claimRotation(credentials) {
+  const key = identityKey(credentials);
+  const now = Date.now();
+  const last = rotationState.get(key) || 0;
+  if (now - last < ROTATE_COOLDOWN_MS) return false;
+  rotationState.set(key, now);
+  if (rotationState.size > MAX_STABLE_SESSIONS) {
+    rotationState.delete(rotationState.keys().next().value);
+  }
+  return true;
+}
+
+/**
+ * Forget the session minted for one conversation so the next resolve mints a
+ * new one. Returns true when a rotation was claimed, i.e. the caller should
+ * retry — the session store may hold no entry yet for a conversation whose
+ * session came from a client header, and that still needs re-minting.
+ */
+function rotateConversationSession(credentials, providerSessionId, clientTool) {
+  if (!claimRotation(credentials)) return false;
+  const key = identityKey(credentials);
+  stableOpencodeSessions.delete(key);
+  const raw = providerSessionId || nativeSession(credentials?.rawHeaders);
+  if (raw) translatedOpencodeSessions.delete(translationKey(raw, clientTool));
+  return true;
+}
+
+/** Test hook: clear rotation bookkeeping so each test starts from zero. */
+export function resetOpencodeSessionRotation() {
+  rotationState.clear();
+  stableOpencodeSessions.clear();
+  translatedOpencodeSessions.clear();
+}
+
+export const __test__ = { ROTATE_COOLDOWN_MS, isSessionQuotaError };
 
 function bodyHasSessionHints(body) {
   try {
@@ -347,6 +419,21 @@ function dropAdaptiveReasoningEffort(body) {
   if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
 }
 
+/**
+ * Read an error response's body without consuming it: the caller still needs
+ * the stream when rotation is skipped. Returns "" when the body cannot be
+ * peeked, which `isSessionQuotaError` treats as a plain session 429.
+ */
+async function peekErrorText(response) {
+  if (!response?.body || typeof response.clone !== "function") return "";
+  try {
+    const text = await response.clone().text();
+    return text.slice(0, 2000);
+  } catch {
+    return "";
+  }
+}
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
@@ -408,16 +495,24 @@ export class OpenCodeExecutor extends BaseExecutor {
   // `directFetch` when no proxy is configured). Fail-open: without wreq-js the
   // request still goes out on native fetch instead of erroring here.
   async execute(args) {
-    const credentials = this.prepareRequestCredentials(args);
-    return super.execute({
-      ...args,
-      credentials,
-      directFetch: (url, options) => opencodeTlsFetch(url, {
-        method: options.method,
-        headers: options.headers,
-        body: options.body,
-      }, { signal: options.signal }),
-    });
+    const directFetch = (url, options) => opencodeTlsFetch(url, {
+      method: options.method,
+      headers: options.headers,
+      body: options.body,
+    }, { signal: options.signal });
+
+    const send = (credentials) => super.execute({ ...args, credentials, directFetch });
+
+    const result = await send(this.prepareRequestCredentials(args));
+
+    // A session-scoped 429 is recoverable: re-mint and send once more. Without
+    // this the exhausted session stayed pinned in RAM and every later request
+    // failed until the process restarted.
+    if (!isSessionQuotaError(result.response.status, await peekErrorText(result.response))) return result;
+    if (!rotateConversationSession(args.credentials, args.providerSessionId, args.clientTool)) return result;
+
+    args.log?.debug?.("RETRY", "opencode 429 — rotated upstream session, retrying once");
+    return send(this.prepareRequestCredentials(args));
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now
