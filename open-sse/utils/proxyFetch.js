@@ -262,7 +262,8 @@ async function fetchWithTlsFallback(url, options, proxyUrl) {
     // proxied through undici it is refused the same way. The adapter owns the
     // CONNECT itself (wreq-js speaks http(s) and SOCKS4/5), so hand it both.
     if (options.directFetch) {
-      return await options.directFetch(url, options, proxyUrl || null);
+      const adapted = await options.directFetch(url, options, proxyUrl || null);
+      if (adapted) return adapted;
     }
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
     return await originalFetch(url, dispatcher ? { ...options, dispatcher } : options);

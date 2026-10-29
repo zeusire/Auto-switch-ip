@@ -32,6 +32,8 @@ COPY . ./
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
+FROM oven/bun:1-alpine AS bunbin
+
 FROM ${NODE_IMAGE} AS runner
 ARG ALPINE_MIRROR
 ARG APP_VERSION
@@ -55,6 +57,9 @@ COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/custom-server.js ./custom-server.js
 COPY --from=builder /app/open-sse ./open-sse
+# The OpenCode free lane is forwarded through a Bun sidecar that tracing cannot follow.
+COPY --from=builder /app/scripts ./scripts
+COPY --from=bunbin /usr/local/bin/bun /usr/local/bin/bun
 # Next file tracing can omit sibling files; MITM runs server.js as a separate process.
 COPY --from=builder /app/src/mitm ./src/mitm
 # Standalone node_modules may omit deps only required by the MITM child process.

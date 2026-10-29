@@ -7,7 +7,7 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
-import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
+import { fetchViaTransport } from "../utils/opencodeTransport.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
@@ -506,19 +506,17 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
-  // no matter how faithful the body is. Route through the impersonating client,
-  // which also has to own the proxy hop: `proxyAwareFetch` passes the resolved
-  // proxy URL to `directFetch` so this stays the only transport even when an
-  // outbound proxy (sing-box / WARP rotation) is configured. Fail-open: without
-  // wreq-js the request still goes out on native fetch instead of erroring here.
+  // no matter how faithful the body is. Forward through the local Bun sidecar,
+  // which owns the proxy hop too; proxyAwareFetch passes the resolved proxy URL
+  // to directFetch. Fail-open: without Bun the request still goes out on native
+  // fetch instead of erroring here.
   async execute(args) {
     // Resolved per request: the Auto Switch IP engine rewrites the proxy row
     // while the server is running, and a session pins its proxy at creation.
-    const directFetch = (url, options, proxyUrl) => opencodeTlsFetch(url, {
-      method: options.method,
-      headers: options.headers,
-      body: options.body,
-    }, { signal: options.signal, proxyUrl: proxyUrl || "" });
+    const directFetch = (url, options, proxyUrl) => fetchViaTransport(url, options, {
+      proxyUrl: proxyUrl || "",
+      signal: options.signal,
+    });
 
     const send = (credentials) => super.execute({ ...args, credentials, directFetch });
 
